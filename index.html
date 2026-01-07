@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>WebRTC P2P - Step 1</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            max-width: 600px;
+        }
+        #log {
+            background: #1a1a1a;
+            color: #0f0;
+            padding: 10px;
+            height: 200px;
+            overflow-y: auto;
+            margin: 10px 0;
+        }
+        input {
+            width: 300px;
+            padding: 5px;
+        }
+        button {
+            padding: 5px 15px;
+        }
+        .status {
+            padding: 5px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebRTC P2P - Step 1</h1>
+    <p>STUNなしでDataChannel接続するサンプル</p>
+
+    <div class="status">
+        Status: <span id="status">Connecting...</span>
+    </div>
+
+    <div id="log"></div>
+
+    <input id="msg" placeholder="メッセージを入力" />
+    <button onclick="send()">Send</button>
+
+<script>
+const log = (msg) => {
+    const el = document.getElementById('log');
+    el.innerHTML += msg + '<br>';
+    el.scrollTop = el.scrollHeight;
+    console.log(msg);
+};
+
+const setStatus = (s) => {
+    document.getElementById('status').textContent = s;
+};
+
+// RTCPeerConnection を作成（STUNなし）
+let pc = new RTCPeerConnection();
+let channel = null;
+
+// DataChannel を作成（Offer側が作る）
+channel = pc.createDataChannel("nyx");
+
+channel.onopen = () => {
+    log("✅ DataChannel OPEN!");
+    setStatus("Connected");
+};
+
+channel.onclose = () => {
+    log("❌ DataChannel closed");
+    setStatus("Disconnected");
+};
+
+channel.onmessage = (e) => {
+    log("📩 Recv: " + e.data);
+};
+
+// ICE状態の変化をログ
+pc.oniceconnectionstatechange = () => {
+    log("🔗 ICE state: " + pc.iceConnectionState);
+};
+
+async function start() {
+    log("Starting WebRTC connection...");
+
+    // Offer を作成
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    log("📤 Created offer");
+
+    // WebSocket でシグナリングサーバーに接続
+    const ws = new WebSocket("ws://" + location.host + "/ws");
+
+    ws.onopen = () => {
+        log("🔌 WebSocket connected");
+        // Offer を送信
+        ws.send(JSON.stringify({
+            sdp: pc.localDescription.sdp,
+            type: pc.localDescription.type
+        }));
+        log("📤 Sent offer to server");
+    };
+
+    ws.onmessage = async (e) => {
+        const answer = JSON.parse(e.data);
+        log("📥 Received answer from server");
+        await pc.setRemoteDescription(answer);
+        log("✅ Remote description set");
+    };
+
+    ws.onerror = (e) => {
+        log("❌ WebSocket error");
+        setStatus("Error");
+    };
+
+    ws.onclose = () => {
+        log("🔌 WebSocket closed");
+    };
+}
+
+function send() {
+    const input = document.getElementById('msg');
+    const msg = input.value;
+    if (msg && channel && channel.readyState === 'open') {
+        channel.send(msg);
+        log("📤 Sent: " + msg);
+        input.value = '';
+    } else {
+        log("⚠️ Channel not ready");
+    }
+}
+
+// Enter キーで送信
+document.getElementById('msg').addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') send();
+});
+
+// 接続開始
+start();
+</script>
+</body>
+</html>
