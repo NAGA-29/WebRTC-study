@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Phase 3: DataChannel Chat (Answerer)</title>
+  <style>
+    body { font-family: sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }
+    h1 { color: #333; font-size: 1.3em; }
+    .status { padding: 8px 12px; border-radius: 4px; margin: 8px 0; font-weight: bold; }
+    .waiting     { background: #e9ecef; color: #495057; }
+    .connecting  { background: #fff3cd; color: #856404; }
+    .connected   { background: #d4edda; color: #155724; }
+    .failed      { background: #f8d7da; color: #721c24; }
+    #chat { border: 1px solid #ccc; border-radius: 4px; height: 250px;
+            overflow-y: auto; padding: 10px; margin: 10px 0; background: #fafafa; }
+    .msg-me   { text-align: right; margin: 4px 0; }
+    .msg-them { text-align: left;  margin: 4px 0; color: #107c10; }
+    .bubble { display: inline-block; padding: 6px 12px; border-radius: 16px; max-width: 80%; }
+    .msg-me   .bubble { background: #107c10; color: white; }
+    .msg-them .bubble { background: #e9ecef; color: #333; }
+    .input-row { display: flex; gap: 8px; }
+    .input-row input { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+    .input-row button { padding: 8px 16px; cursor: pointer; }
+    .log { background: #1e1e1e; color: #d4d4d4; padding: 8px; height: 150px;
+           overflow-y: auto; font-size: 11px; white-space: pre-wrap; border-radius: 4px;
+           font-family: monospace; margin-top: 10px; }
+    .ok   { color: #4ec9b0; }
+    .warn { color: #dcdcaa; }
+    .err  { color: #f44747; }
+    details summary { cursor: pointer; font-size: 12px; color: #666; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Phase 3: DataChannel Chat — <span style="color:#107c10">Answerer</span></h1>
+  <p>Offerを自動で待ちます。先に <a href="/" target="_blank">index.html</a>（Offerer）で「接続開始」を押してください。</p>
+
+  <div id="statusDiv" class="status waiting">状態: Offerを待機中...</div>
+  <button onclick="resetAll()" style="background:#dc3545;color:white">リセット</button>
+
+  <!-- チャットUI -->
+  <div id="chatArea" style="display:none; margin-top:16px;">
+    <strong>チャット（DataChannel経由）</strong>
+    <div id="chat"></div>
+    <div class="input-row">
+      <input id="msgInput" type="text" placeholder="メッセージを入力..." onkeydown="if(event.key==='Enter')sendMsg()">
+      <button onclick="sendMsg()">送信</button>
+    </div>
+  </div>
+
+  <details>
+    <summary>接続ログ（開発用）</summary>
+    <div id="log" class="log"></div>
+  </details>
+
+  <script>
+    let dc = null;
+
+    function log(msg, type = '') {
+      const el = document.getElementById('log');
+      const time = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+      el.innerHTML += `<span class="${type}">[${time}] ${msg}</span>\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(msg, cls) {
+      const el = document.getElementById('statusDiv');
+      el.textContent = '状態: ' + msg;
+      el.className = 'status ' + cls;
+    }
+
+    function addMessage(side, text) {
+      const chat = document.getElementById('chat');
+      const div = document.createElement('div');
+      div.className = side === 'me' ? 'msg-me' : 'msg-them';
+      div.innerHTML = `<span class="bubble">${escapeHtml(text)}</span>`;
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    async function waitForOffer() {
+      while (true) {
+        const res = await fetch('/offer');
+        if (res.status === 200) {
+          const data = await res.json();
+          return JSON.parse(data.sdp);
+        }
+        await sleep(1000);
+      }
+    }
+
+    async function postAnswer(answer) {
+      await fetch('/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: JSON.stringify(answer) }),
+      });
+    }
+
+    async function postCandidate(candidate) {
+      await fetch('/candidates?side=answerer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ candidate: JSON.stringify(candidate) }),
+      });
+    }
+
+    let offererCandidateIdx = 0;
+    async function pollOffererCandidates(pc) {
+      const res = await fetch('/candidates?side=offerer');
+      const data = await res.json();
+      const candidates = data.candidates || [];
+      for (let i = offererCandidateIdx; i < candidates.length; i++) {
+        await pc.addIceCandidate(new RTCIceCandidate(JSON.parse(candidates[i])));
+      }
+      offererCandidateIdx = candidates.length;
+      if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
+        setTimeout(() => pollOffererCandidates(pc), 1000);
+      }
+    }
+
+    // ===== メイン処理 =====
+    async function main() {
+      const pc = new RTCPeerConnection({ iceServers: [] });
+
+      // =====================================================
+      // Phase 3 の追加ポイント: ondatachannel で受け取る
+      // Answerer側は createDataChannel() を呼ばない
+      // Offererが作ったDataChannelが自動的に届く
+      // =====================================================
+      pc.ondatachannel = (event) => {
+        dc = event.channel; // DataChannelを受け取る
+        log(`DataChannel 受信: name="${dc.label}"`, 'ok');
+
+        dc.onopen = () => {
+          log('DataChannel オープン！', 'ok');
+          setStatus('接続成功！チャットできます', 'connected');
+          document.getElementById('chatArea').style.display = 'block';
+          document.getElementById('msgInput').focus();
+        };
+
+        dc.onclose = () => {
+          log('DataChannel クローズ', 'warn');
+          setStatus('DataChannel 切断', 'waiting');
+          document.getElementById('chatArea').style.display = 'none';
+        };
+
+        dc.onmessage = (event) => {
+          log(`受信: ${event.data}`, 'ok');
+          addMessage('them', event.data);
+        };
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        log(`ICE状態: ${pc.iceConnectionState}`, 'warn');
+        if (pc.iceConnectionState === 'failed') {
+          setStatus('ICE接続失敗', 'failed');
+        }
+      };
+
+      pc.onicecandidate = async (event) => {
+        if (event.candidate) {
+          await postCandidate(event.candidate.toJSON());
+          log(`ICE candidate 送信: type=${event.candidate.type || 'host'}`);
+        }
+      };
+
+      // Offer待機 → setRemoteDescription
+      log('Offerを待機中...');
+      const offer = await waitForOffer();
+      log('Offer 受信！', 'ok');
+      setStatus('Offer受信。接続中...', 'connecting');
+
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+      // Answer 作成・送信
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await postAnswer(answer);
+      log('Answer 送信完了', 'ok');
+
+      pollOffererCandidates(pc);
+    }
+
+    function sendMsg() {
+      if (!dc || dc.readyState !== 'open') {
+        log('DataChannelが開いていません', 'err');
+        return;
+      }
+      const input = document.getElementById('msgInput');
+      const text = input.value.trim();
+      if (!text) return;
+
+      dc.send(text);
+      log(`送信: ${text}`);
+      addMessage('me', text);
+      input.value = '';
+    }
+
+    async function resetAll() {
+      await fetch('/reset', { method: 'DELETE' });
+      dc = null;
+      offererCandidateIdx = 0;
+      document.getElementById('chatArea').style.display = 'none';
+      document.getElementById('chat').innerHTML = '';
+      setStatus('リセット済み。ページをリロードしてください', 'waiting');
+      log('--- リセット ---', 'warn');
+    }
+
+    log('Answerer タブ 起動');
+    main();
+  </script>
+</body>
+</html>

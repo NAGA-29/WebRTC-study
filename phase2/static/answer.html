@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Phase 2: PeerConnection (Answerer)</title>
+  <style>
+    body { font-family: monospace; max-width: 700px; margin: 40px auto; padding: 0 20px; }
+    h1 { color: #333; }
+    .status { padding: 8px 12px; border-radius: 4px; margin: 8px 0; font-weight: bold; }
+    .connecting { background: #fff3cd; color: #856404; }
+    .connected   { background: #d4edda; color: #155724; }
+    .failed      { background: #f8d7da; color: #721c24; }
+    button { padding: 8px 18px; font-size: 14px; cursor: pointer; margin: 4px; }
+    .log { background: #1e1e1e; color: #d4d4d4; padding: 10px; height: 300px;
+           overflow-y: auto; font-size: 12px; white-space: pre-wrap; border-radius: 4px; margin-top: 10px; }
+    .ok   { color: #4ec9b0; }
+    .warn { color: #dcdcaa; }
+    .err  { color: #f44747; }
+  </style>
+</head>
+<body>
+  <h1>Phase 2: PeerConnection — <span style="color:#107c10">Answerer（応答側）</span></h1>
+  <p>このタブはOfferを待ち、<strong>Answer</strong> を返します。<br>
+  先に <a href="/" target="_blank">index.html</a>（Offerer）で「接続開始」を押してください。</p>
+
+  <div id="statusDiv" class="status connecting">状態: Offerを待機中...</div>
+  <button onclick="resetAll()" style="background:#dc3545;color:white">リセット</button>
+
+  <div id="log" class="log"></div>
+
+  <script>
+    function log(msg, type = '') {
+      const el = document.getElementById('log');
+      const time = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+      el.innerHTML += `<span class="${type}">[${time}] ${msg}</span>\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(msg, cls) {
+      const el = document.getElementById('statusDiv');
+      el.textContent = '状態: ' + msg;
+      el.className = 'status ' + cls;
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    // --- シグナリング関数 ---
+
+    // Offerをポーリングで取得する
+    async function waitForOffer() {
+      while (true) {
+        const res = await fetch('/offer');
+        if (res.status === 200) {
+          const data = await res.json();
+          return JSON.parse(data.sdp);
+        }
+        await sleep(1000);
+      }
+    }
+
+    // Answerをサーバーに送信する
+    async function postAnswer(answer) {
+      await fetch('/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: JSON.stringify(answer) }),
+      });
+    }
+
+    // 自分のICE candidateをサーバーに送信する（answerer側）
+    async function postCandidate(candidate) {
+      await fetch('/candidates?side=answerer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ candidate: JSON.stringify(candidate) }),
+      });
+    }
+
+    // Offerer側のcandidatesをポーリングで取得して追加する
+    let offererCandidateIdx = 0;
+    async function pollOffererCandidates(pc) {
+      const res = await fetch('/candidates?side=offerer');
+      const data = await res.json();
+      const candidates = data.candidates || [];
+
+      for (let i = offererCandidateIdx; i < candidates.length; i++) {
+        const c = JSON.parse(candidates[i]);
+        await pc.addIceCandidate(new RTCIceCandidate(c));
+        log(`ICE candidate (offerer) 追加: type=${c.type || 'host'}`, 'ok');
+      }
+      offererCandidateIdx = candidates.length;
+
+      if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
+        setTimeout(() => pollOffererCandidates(pc), 1000);
+      }
+    }
+
+    // ===== メイン処理（ページ読み込みと同時に自動開始）=====
+    async function main() {
+      // --- 1. RTCPeerConnection を作成 ---
+      const pc = new RTCPeerConnection({ iceServers: [] });
+
+      pc.oniceconnectionstatechange = () => {
+        log(`ICE接続状態: ${pc.iceConnectionState}`, 'warn');
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          setStatus('接続成功！', 'connected');
+          log('🎉 PeerConnection 確立！', 'ok');
+        } else if (pc.iceConnectionState === 'failed') {
+          setStatus('接続失敗', 'failed');
+          log('接続に失敗しました', 'err');
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        log(`接続状態: ${pc.connectionState}`);
+      };
+
+      // --- 2. 自分のICE candidateをサーバーに送る ---
+      pc.onicecandidate = async (event) => {
+        if (!event.candidate) {
+          log('ICE candidate収集完了');
+          return;
+        }
+        await postCandidate(event.candidate.toJSON());
+        log(`ICE candidate (answerer) 送信: type=${event.candidate.type || 'host'}`);
+      };
+
+      // --- 3. Offerが届くまでポーリング ---
+      log('Offerを待機中...');
+      const offer = await waitForOffer();
+      log('Offer 受信！', 'ok');
+
+      // --- 4. Offerをセット → これで相手の接続情報を認識 ---
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      log('setRemoteDescription (offer) 完了', 'ok');
+
+      // --- 5. Answer を作成 ---
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer); // ← ICE収集がここで始まる
+      log('Answer 作成完了', 'ok');
+
+      // --- 6. Answer をシグナリングサーバーに保存 ---
+      await postAnswer(answer);
+      log('Answer 送信完了。ICE接続を開始します...', 'ok');
+      setStatus('ICE接続中...', 'connecting');
+
+      // --- 7. Offerer側のcandidatesをポーリング開始 ---
+      pollOffererCandidates(pc);
+    }
+
+    async function resetAll() {
+      await fetch('/reset', { method: 'DELETE' });
+      offererCandidateIdx = 0;
+      setStatus('リセット済み。ページをリロードしてください', 'connecting');
+      log('--- リセット ---', 'warn');
+    }
+
+    log('Answerer タブ 起動');
+    log('Offerを自動でポーリング中...');
+    main();
+  </script>
+</body>
+</html>

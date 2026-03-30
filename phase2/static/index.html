@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Phase 2: PeerConnection (Offerer)</title>
+  <style>
+    body { font-family: monospace; max-width: 700px; margin: 40px auto; padding: 0 20px; }
+    h1 { color: #333; }
+    .status { padding: 8px 12px; border-radius: 4px; margin: 8px 0; font-weight: bold; }
+    .connecting { background: #fff3cd; color: #856404; }
+    .connected   { background: #d4edda; color: #155724; }
+    .failed      { background: #f8d7da; color: #721c24; }
+    button { padding: 8px 18px; font-size: 14px; cursor: pointer; margin: 4px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .log { background: #1e1e1e; color: #d4d4d4; padding: 10px; height: 300px;
+           overflow-y: auto; font-size: 12px; white-space: pre-wrap; border-radius: 4px; margin-top: 10px; }
+    .ok   { color: #4ec9b0; }
+    .warn { color: #dcdcaa; }
+    .err  { color: #f44747; }
+  </style>
+</head>
+<body>
+  <h1>Phase 2: PeerConnection — <span style="color:#0078d4">Offerer（提供側）</span></h1>
+  <p>このタブが <strong>Offer</strong> を作成してP2P接続を開始します。<br>
+  もう一方のタブで <a href="/answer.html" target="_blank">answer.html</a> を開いてください。</p>
+
+  <div id="statusDiv" class="status connecting">状態: 待機中</div>
+
+  <button id="connectBtn" onclick="startConnection()">接続開始</button>
+  <button onclick="resetAll()" style="background:#dc3545;color:white">リセット</button>
+
+  <div id="log" class="log"></div>
+
+  <script>
+    // ===== ユーティリティ =====
+    function log(msg, type = '') {
+      const el = document.getElementById('log');
+      const time = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+      el.innerHTML += `<span class="${type}">[${time}] ${msg}</span>\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(msg, cls) {
+      const el = document.getElementById('statusDiv');
+      el.textContent = '状態: ' + msg;
+      el.className = 'status ' + cls;
+    }
+
+    // ===== シグナリング関数 =====
+
+    // Offerをサーバーに送信する
+    async function postOffer(offer) {
+      await fetch('/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: JSON.stringify(offer) }),
+      });
+    }
+
+    // Answerをポーリングで取得する（1秒ごとに確認）
+    async function waitForAnswer() {
+      while (true) {
+        const res = await fetch('/answer');
+        if (res.status === 200) {
+          const data = await res.json();
+          return JSON.parse(data.sdp); // RTCSessionDescriptionInit として返す
+        }
+        await sleep(1000); // まだなければ1秒待つ
+      }
+    }
+
+    // 自分のICE candidateをサーバーに送信する（offerer側）
+    async function postCandidate(candidate) {
+      await fetch('/candidates?side=offerer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ candidate: JSON.stringify(candidate) }),
+      });
+    }
+
+    // 相手（answerer）のICE candidatesをポーリングで取得して追加する
+    let answererCandidateIdx = 0; // 処理済みのインデックス
+    async function pollAnswererCandidates(pc) {
+      const res = await fetch('/candidates?side=answerer');
+      const data = await res.json();
+      const candidates = data.candidates || [];
+
+      // 未処理のcandidatesだけ追加する
+      for (let i = answererCandidateIdx; i < candidates.length; i++) {
+        const c = JSON.parse(candidates[i]);
+        await pc.addIceCandidate(new RTCIceCandidate(c));
+        log(`ICE candidate (answerer) 追加: ${c.candidate.split(' ').slice(0, 8).join(' ')}...`, 'ok');
+      }
+      answererCandidateIdx = candidates.length;
+
+      // 接続が完了するまでポーリング継続
+      if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
+        setTimeout(() => pollAnswererCandidates(pc), 1000);
+      }
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    // ===== メイン処理 =====
+
+    async function startConnection() {
+      document.getElementById('connectBtn').disabled = true;
+
+      // --- 1. RTCPeerConnection を作成 ---
+      // STUNなし（ローカル接続のため不要）
+      const pc = new RTCPeerConnection({ iceServers: [] });
+
+      // ICE接続状態が変わるたびにログ出力
+      pc.oniceconnectionstatechange = () => {
+        log(`ICE接続状態: ${pc.iceConnectionState}`, 'warn');
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          setStatus('接続成功！', 'connected');
+          log('🎉 PeerConnection 確立！', 'ok');
+        } else if (pc.iceConnectionState === 'failed') {
+          setStatus('接続失敗', 'failed');
+          log('接続に失敗しました', 'err');
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        log(`接続状態: ${pc.connectionState}`);
+      };
+
+      // --- 2. ICE candidateが生成されたらサーバーに送る ---
+      pc.onicecandidate = async (event) => {
+        if (!event.candidate) {
+          log('ICE candidate収集完了');
+          return;
+        }
+        await postCandidate(event.candidate.toJSON());
+        log(`ICE candidate (offerer) 送信: type=${event.candidate.type || 'host'}`);
+      };
+
+      // --- 3. Offer を作成して自分にセット ---
+      log('Offer を作成中...');
+      setStatus('Offer作成中...', 'connecting');
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);  // ← これでICE収集が始まる
+      log('Offer 作成完了。サーバーに送信します...', 'ok');
+
+      // --- 4. Offer をシグナリングサーバーに保存 ---
+      await postOffer(offer);
+      log('Offer 送信完了。Answererを待っています...', 'ok');
+      setStatus('Answererを待機中...', 'connecting');
+
+      // --- 5. Answererのcandidatesをポーリング開始（並行して動かす）---
+      pollAnswererCandidates(pc);
+
+      // --- 6. Answer が届くまでポーリング ---
+      const answer = await waitForAnswer();
+      log('Answer 受信！setRemoteDescription を呼び出します...', 'ok');
+
+      // --- 7. Answer を自分にセット → ICE接続が始まる ---
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      log('setRemoteDescription 完了。ICE接続を確立中...', 'warn');
+      setStatus('ICE接続中...', 'connecting');
+    }
+
+    async function resetAll() {
+      await fetch('/reset', { method: 'DELETE' });
+      answererCandidateIdx = 0;
+      document.getElementById('connectBtn').disabled = false;
+      setStatus('待機中（リセット済み）', 'connecting');
+      log('--- リセット ---', 'warn');
+    }
+
+    log('Offerer タブ 起動');
+    log('「接続開始」ボタンを押してください。answer.html タブも開いてください。');
+  </script>
+</body>
+</html>

@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Phase 4: NAT越え (STUN/TURN)</title>
+  <style>
+    body { font-family: monospace; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+    h1 { color: #333; font-size: 1.2em; }
+    .status { padding: 8px 12px; border-radius: 4px; margin: 8px 0; font-weight: bold; }
+    .waiting    { background: #e9ecef; color: #495057; }
+    .connecting { background: #fff3cd; color: #856404; }
+    .connected  { background: #d4edda; color: #155724; }
+    .failed     { background: #f8d7da; color: #721c24; }
+    button { padding: 8px 16px; cursor: pointer; margin: 4px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .role-select { margin: 10px 0; }
+    .role-select label { margin-right: 16px; cursor: pointer; }
+
+    /* ICE candidateテーブル */
+    table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 10px 0; }
+    th { background: #333; color: white; padding: 4px 8px; text-align: left; }
+    td { padding: 4px 8px; border-bottom: 1px solid #eee; }
+    .type-host  { color: #0078d4; font-weight: bold; }
+    .type-srflx { color: #107c10; font-weight: bold; }
+    .type-relay { color: #e65c00; font-weight: bold; }
+    .type-prflx { color: #8764b8; font-weight: bold; }
+
+    /* チャット */
+    #chatArea { display: none; margin-top: 16px; }
+    #chat { border: 1px solid #ccc; height: 150px; overflow-y: auto; padding: 8px; background: #fafafa; }
+    .msg-me   { text-align: right; margin: 3px 0; }
+    .msg-them { text-align: left;  margin: 3px 0; color: #0078d4; }
+    .bubble { display: inline-block; padding: 4px 10px; border-radius: 12px; }
+    .msg-me   .bubble { background: #0078d4; color: white; }
+    .msg-them .bubble { background: #e9ecef; color: #333; }
+    .input-row { display: flex; gap: 8px; margin-top: 6px; }
+    .input-row input { flex: 1; padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
+
+    .log { background: #1e1e1e; color: #d4d4d4; padding: 8px; height: 180px;
+           overflow-y: auto; font-size: 11px; white-space: pre-wrap; border-radius: 4px; margin-top: 8px; }
+    .ok   { color: #4ec9b0; }
+    .warn { color: #dcdcaa; }
+    .err  { color: #f44747; }
+    details summary { cursor: pointer; font-size: 12px; color: #666; margin-top: 8px; }
+
+    #iceConfig { background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 12px; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h1>Phase 4: NAT越え — STUN/TURN設定の確認</h1>
+
+  <p>このページはSTUN/TURNの設定を使ってICE candidateを収集し、<br>
+  candidateの種類（host/srflx/relay）を確認することが目標です。</p>
+
+  <!-- ロール選択 -->
+  <div class="role-select">
+    <strong>ロール選択:</strong>
+    <label><input type="radio" name="role" value="offerer" checked> Offerer（接続を開始する側）</label>
+    <label><input type="radio" name="role" value="answerer"> Answerer（接続を受ける側）</label>
+  </div>
+
+  <!-- ICEサーバー設定表示 -->
+  <div id="iceConfig">ICEサーバー設定を読み込み中...</div>
+
+  <div id="statusDiv" class="status waiting">状態: 待機中</div>
+  <button id="connectBtn" onclick="startConnection()">接続開始</button>
+  <button onclick="resetAll()" style="background:#dc3545;color:white">リセット</button>
+
+  <!-- ICE candidate一覧テーブル -->
+  <h3 style="margin-top:16px; font-size:1em;">収集されたICE Candidates</h3>
+  <p style="font-size:12px; margin:0 0 4px;">
+    <span class="type-host">host</span>=ローカルIP、
+    <span class="type-srflx">srflx</span>=STUNで発見したグローバルIP、
+    <span class="type-relay">relay</span>=TURN経由アドレス
+  </p>
+  <table>
+    <thead>
+      <tr><th>#</th><th>type</th><th>protocol</th><th>address</th><th>port</th></tr>
+    </thead>
+    <tbody id="candidateTable"></tbody>
+  </table>
+
+  <!-- チャット（接続後） -->
+  <div id="chatArea">
+    <strong>チャット（DataChannel経由）</strong>
+    <div id="chat"></div>
+    <div class="input-row">
+      <input id="msgInput" type="text" placeholder="メッセージを入力..." onkeydown="if(event.key==='Enter')sendMsg()">
+      <button onclick="sendMsg()">送信</button>
+    </div>
+  </div>
+
+  <details>
+    <summary>詳細ログ</summary>
+    <div id="log" class="log"></div>
+  </details>
+
+  <script>
+    let dc = null;
+    let candidateCount = 0;
+
+    function log(msg, type = '') {
+      const el = document.getElementById('log');
+      const time = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+      el.innerHTML += `<span class="${type}">[${time}] ${msg}</span>\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(msg, cls) {
+      const el = document.getElementById('statusDiv');
+      el.textContent = '状態: ' + msg;
+      el.className = 'status ' + cls;
+    }
+
+    function addCandidateRow(candidate) {
+      const tbody = document.getElementById('candidateTable');
+      // "candidate:1 1 UDP 2122252543 192.168.1.10 54321 typ host raddr..." をパース
+      const parts = candidate.split(' ');
+      const protocol = parts[2] || '-';
+      const address  = parts[4] || '-';
+      const port     = parts[5] || '-';
+      const typeIdx  = parts.indexOf('typ');
+      const type     = typeIdx >= 0 ? parts[typeIdx + 1] : 'unknown';
+      const typeClass = `type-${type}`;
+
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${++candidateCount}</td>
+        <td class="${typeClass}">${type}</td>
+        <td>${protocol}</td>
+        <td>${address}</td>
+        <td>${port}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+
+    function addMessage(side, text) {
+      const chat = document.getElementById('chat');
+      const div = document.createElement('div');
+      div.className = side === 'me' ? 'msg-me' : 'msg-them';
+      div.innerHTML = `<span class="bubble">${text.replace(/</g,'&lt;')}</span>`;
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    // ICEサーバー設定を取得して表示する
+    let iceServers = [];
+    async function loadConfig() {
+      const res = await fetch('/config');
+      const config = await res.json();
+      iceServers = config.iceServers;
+      document.getElementById('iceConfig').innerHTML =
+        '<strong>ICEサーバー設定:</strong> ' +
+        iceServers.map(s => `<code>${s.urls}</code>${s.username ? ' (TURN)' : ''}`).join(', ');
+      log('ICEサーバー設定読み込み完了: ' + JSON.stringify(iceServers));
+    }
+
+    // シグナリング関数
+    async function postOffer(offer) {
+      await fetch('/offer', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: JSON.stringify(offer) }) });
+    }
+
+    async function waitForOffer() {
+      while (true) {
+        const res = await fetch('/offer');
+        if (res.status === 200) { const d = await res.json(); return JSON.parse(d.sdp); }
+        await sleep(1000);
+      }
+    }
+
+    async function postAnswer(answer) {
+      await fetch('/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: JSON.stringify(answer) }) });
+    }
+
+    async function waitForAnswer() {
+      while (true) {
+        const res = await fetch('/answer');
+        if (res.status === 200) { const d = await res.json(); return JSON.parse(d.sdp); }
+        await sleep(1000);
+      }
+    }
+
+    async function postCandidate(side, candidate) {
+      await fetch(`/candidates?side=${side}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ candidate: JSON.stringify(candidate) }) });
+    }
+
+    function pollCandidates(pc, mySide, theirSide) {
+      let idx = 0;
+      const poll = async () => {
+        const res = await fetch(`/candidates?side=${theirSide}`);
+        const data = await res.json();
+        const candidates = data.candidates || [];
+        for (let i = idx; i < candidates.length; i++) {
+          await pc.addIceCandidate(new RTCIceCandidate(JSON.parse(candidates[i])));
+        }
+        idx = candidates.length;
+        if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
+          setTimeout(poll, 1000);
+        }
+      };
+      poll();
+    }
+
+    // ===== メイン処理 =====
+    async function startConnection() {
+      document.getElementById('connectBtn').disabled = true;
+      setStatus('接続中...', 'connecting');
+
+      const role = document.querySelector('input[name="role"]:checked').value;
+
+      // =====================================================
+      // Phase 4 の重要ポイント: iceServers を設定する
+      // STUNサーバーを指定することでsrflx candidateが収集される
+      // TURNサーバーも設定するとrelay candidateも収集される
+      // =====================================================
+      const pc = new RTCPeerConnection({ iceServers });
+
+      pc.onicecandidate = async (event) => {
+        if (!event.candidate) {
+          log('ICE candidate収集完了（全種類を表示してください）', 'ok');
+          return;
+        }
+        const cand = event.candidate.toJSON();
+        const candidateStr = event.candidate.candidate || '';
+
+        // テーブルに追加してtypeを可視化
+        addCandidateRow(candidateStr);
+
+        // typeによってログの色を変える
+        const typeMatch = candidateStr.match(/typ (\w+)/);
+        const type = typeMatch ? typeMatch[1] : 'unknown';
+        const typeColor = { host: 'ok', srflx: 'warn', relay: 'err' }[type] || '';
+        log(`ICE candidate: type=${type} addr=${cand.address || '-'}:${cand.port || '-'}`, typeColor);
+
+        // サーバーに送信
+        await postCandidate(role, cand);
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        log(`ICE状態: ${pc.iceConnectionState}`, 'warn');
+        if (['connected', 'completed'].includes(pc.iceConnectionState)) {
+          setStatus('接続成功！', 'connected');
+        } else if (pc.iceConnectionState === 'failed') {
+          setStatus('ICE接続失敗（STUNまたはTURNが必要かもしれません）', 'failed');
+        }
+      };
+
+      if (role === 'offerer') {
+        // DataChannel作成
+        dc = pc.createDataChannel('chat', { ordered: true });
+        setupDataChannel(dc);
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await postOffer(offer);
+        log('Offer 送信完了');
+
+        pollCandidates(pc, 'offerer', 'answerer');
+
+        const answer = await waitForAnswer();
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        log('Answer 受信・セット完了', 'ok');
+
+      } else {
+        // Answerer
+        pc.ondatachannel = (event) => {
+          dc = event.channel;
+          setupDataChannel(dc);
+        };
+
+        log('Offerを待機中...');
+        const offer = await waitForOffer();
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await postAnswer(answer);
+        log('Answer 送信完了', 'ok');
+
+        pollCandidates(pc, 'answerer', 'offerer');
+      }
+    }
+
+    function setupDataChannel(channel) {
+      channel.onopen = () => {
+        setStatus('DataChannel 開通！チャットできます', 'connected');
+        document.getElementById('chatArea').style.display = 'block';
+        document.getElementById('msgInput').focus();
+      };
+      channel.onmessage = (e) => addMessage('them', e.data);
+      channel.onclose = () => setStatus('DataChannel 切断', 'waiting');
+    }
+
+    function sendMsg() {
+      if (!dc || dc.readyState !== 'open') return;
+      const input = document.getElementById('msgInput');
+      const text = input.value.trim();
+      if (!text) return;
+      dc.send(text);
+      addMessage('me', text);
+      input.value = '';
+    }
+
+    async function resetAll() {
+      await fetch('/reset', { method: 'DELETE' });
+      dc = null;
+      candidateCount = 0;
+      document.getElementById('candidateTable').innerHTML = '';
+      document.getElementById('chatArea').style.display = 'none';
+      document.getElementById('connectBtn').disabled = false;
+      setStatus('待機中（リセット済み）', 'waiting');
+      log('--- リセット ---', 'warn');
+    }
+
+    // 起動時にICE設定を読み込む
+    loadConfig();
+    log('Phase 4 起動。ICEサーバー設定を確認してください。');
+    log('接続後に candidate テーブルの type 列に注目してください。');
+    log('  host = ローカルネットワークのIP');
+    log('  srflx = STUNで発見したグローバルIP');
+    log('  relay = TURN経由のアドレス（TURNが必要）', 'warn');
+  </script>
+</body>
+</html>
