@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Final: WebRTCフル実装</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px;
+           color: #333; }
+    h1 { font-size: 1.4em; margin-bottom: 4px; }
+    .subtitle { color: #666; font-size: 13px; margin-bottom: 16px; }
+
+    /* レイアウト */
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    .panel { border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+    .panel h2 { margin: 0 0 8px; font-size: 1em; color: #555; }
+
+    /* ステータス */
+    .status-bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+    .badge { padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+    .badge-waiting    { background: #e9ecef; color: #495057; }
+    .badge-connecting { background: #fff3cd; color: #856404; }
+    .badge-connected  { background: #d4edda; color: #155724; }
+    .badge-failed     { background: #f8d7da; color: #721c24; }
+
+    /* ルーム設定 */
+    #setupPanel { grid-column: 1 / -1; }
+    .form-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+    .form-row label { font-size: 13px; font-weight: bold; }
+    .form-row input { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; width: 160px; }
+    .form-row select { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
+    button { padding: 7px 16px; border: none; border-radius: 4px; cursor: pointer;
+             font-size: 13px; background: #0078d4; color: white; }
+    button:hover { background: #006cc1; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-danger { background: #dc3545; }
+    .btn-danger:hover { background: #c82333; }
+    .btn-secondary { background: #6c757d; }
+
+    /* チャット */
+    #chatMessages { height: 240px; overflow-y: auto; padding: 8px; background: #fafafa;
+                    border: 1px solid #eee; border-radius: 4px; margin-bottom: 8px; }
+    .msg { margin: 4px 0; }
+    .msg-me   { text-align: right; }
+    .msg-them { text-align: left; }
+    .bubble { display: inline-block; padding: 6px 12px; border-radius: 16px; max-width: 85%;
+              word-break: break-word; font-size: 14px; }
+    .msg-me   .bubble { background: #0078d4; color: white; }
+    .msg-them .bubble { background: #e9ecef; color: #333; }
+    .msg-system { text-align: center; font-size: 12px; color: #888; }
+    .msg-input-row { display: flex; gap: 6px; }
+    .msg-input-row input { flex: 1; padding: 7px 10px; border: 1px solid #ccc;
+                           border-radius: 4px; font-size: 14px; }
+
+    /* 接続ログパネル */
+    #logPanel { height: 280px; overflow-y: auto; font-family: monospace; font-size: 11px; }
+    .log-entry { padding: 2px 0; border-bottom: 1px solid #f0f0f0; }
+    .log-entry.local { color: #888; }
+    .log-time  { color: #888; }
+    .log-event { color: #0078d4; font-weight: bold; }
+    .log-msg   { color: #333; }
+
+    /* ルームID表示 */
+    #roomIdDisplay { font-family: monospace; font-size: 13px; background: #f0f4ff;
+                     padding: 4px 10px; border-radius: 4px; }
+
+    @media (max-width: 600px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Final: WebRTC フル実装</h1>
+  <p class="subtitle">Go+Echoシグナリング + DataChannelチャット + 接続ログパネル</p>
+
+  <div class="grid">
+
+    <!-- セットアップパネル -->
+    <div class="panel" id="setupPanel">
+      <h2>接続設定</h2>
+      <div class="form-row">
+        <label>ルームID:</label>
+        <input id="roomIdInput" type="text" placeholder="空欄で自動生成" value="">
+        <label>ロール:</label>
+        <select id="roleSelect">
+          <option value="offerer">Offerer（接続開始）</option>
+          <option value="answerer">Answerer（接続待機）</option>
+        </select>
+        <button id="connectBtn" onclick="handleConnect()">接続開始</button>
+        <button class="btn-danger" onclick="handleReset()">リセット</button>
+      </div>
+      <div class="status-bar">
+        <span>ルームID: </span><span id="roomIdDisplay">-</span>
+        <span id="iceStatusBadge" class="badge badge-waiting">ICE: -</span>
+        <span id="connStatusBadge" class="badge badge-waiting">接続: -</span>
+        <span id="dcStatusBadge" class="badge badge-waiting">DataChannel: -</span>
+      </div>
+    </div>
+
+    <!-- チャットパネル -->
+    <div class="panel">
+      <h2>チャット（DataChannel）</h2>
+      <div id="chatMessages">
+        <div class="msg msg-system">接続するとチャットできます</div>
+      </div>
+      <div class="msg-input-row">
+        <input id="msgInput" type="text" placeholder="メッセージを入力..."
+               disabled onkeydown="if(event.key==='Enter')sendMsg()">
+        <button id="sendBtn" onclick="sendMsg()" disabled>送信</button>
+      </div>
+    </div>
+
+    <!-- 接続ログパネル -->
+    <div class="panel">
+      <h2>接続ログ <button class="btn-secondary" style="font-size:11px;padding:2px 8px" onclick="clearLog()">クリア</button></h2>
+      <div id="logPanel"></div>
+    </div>
+
+  </div>
+
+  <script type="module">
+    import { RoomClient, WebRTCClient, LogPanel } from './app.js';
+
+    // ===== グローバル変数 =====
+    let roomClient = null;
+    let webrtcClient = null;
+    let logPanel = null;
+
+    // ===== 接続開始 =====
+    window.handleConnect = async () => {
+      const roomIdInput = document.getElementById('roomIdInput').value.trim();
+      const role = document.getElementById('roleSelect').value;
+
+      document.getElementById('connectBtn').disabled = true;
+      document.getElementById('setupPanel').querySelectorAll('input, select').forEach(el => el.disabled = true);
+
+      // ルームの作成または参加
+      if (roomIdInput) {
+        // ルームIDが指定された場合 → そのルームに参加（Answerer側）
+        roomClient = new RoomClient(roomIdInput);
+        updateRoomId(roomIdInput);
+        localLog(`ルーム ${roomIdInput} に参加します`);
+      } else {
+        // ルームIDが未指定 → 新規作成（Offerer側）
+        roomClient = await RoomClient.create();
+        updateRoomId(roomClient.roomId);
+        localLog(`ルーム ${roomClient.roomId} を作成しました`);
+      }
+
+      // ログパネルの初期化
+      logPanel = new LogPanel('logPanel', roomClient);
+      logPanel.startPolling(1500);
+
+      // WebRTC接続の開始
+      webrtcClient = new WebRTCClient(roomClient, role, {
+        onMessage: (text) => {
+          addMessage('them', text);
+        },
+        onStateChange: (type, state) => {
+          localLog(`${type}: ${state}`);
+          updateStatus(type, state);
+        },
+      });
+
+      localLog(`${role} として接続開始...`);
+
+      if (role === 'offerer') {
+        await webrtcClient.connectAsOfferer();
+      } else {
+        await webrtcClient.connectAsAnswerer();
+      }
+    };
+
+    // ===== メッセージ送信 =====
+    window.sendMsg = () => {
+      if (!webrtcClient) return;
+      const input = document.getElementById('msgInput');
+      const text = input.value.trim();
+      if (!text) return;
+      try {
+        webrtcClient.send(text);
+        addMessage('me', text);
+        input.value = '';
+      } catch (e) {
+        localLog(`送信エラー: ${e.message}`, true);
+      }
+    };
+
+    // ===== リセット =====
+    window.handleReset = async () => {
+      if (webrtcClient) webrtcClient.close();
+      if (logPanel) logPanel.stopPolling();
+      if (roomClient) await roomClient.reset();
+
+      webrtcClient = null;
+      roomClient = null;
+      logPanel = null;
+
+      // UIをリセット
+      document.getElementById('connectBtn').disabled = false;
+      document.getElementById('setupPanel').querySelectorAll('input, select').forEach(el => el.disabled = false);
+      document.getElementById('roomIdInput').value = '';
+      document.getElementById('roomIdDisplay').textContent = '-';
+      document.getElementById('chatMessages').innerHTML = '<div class="msg msg-system">接続するとチャットできます</div>';
+      document.getElementById('msgInput').disabled = true;
+      document.getElementById('sendBtn').disabled = true;
+      updateStatus('ice', '-');
+      updateStatus('connection', '-');
+      updateStatus('datachannel', '-');
+    };
+
+    window.clearLog = () => {
+      if (logPanel) logPanel.clear();
+    };
+
+    // ===== UI更新ヘルパー =====
+
+    function updateRoomId(id) {
+      document.getElementById('roomIdDisplay').textContent = id;
+    }
+
+    function addMessage(side, text) {
+      const container = document.getElementById('chatMessages');
+      // 「チャットできます」メッセージを消す
+      const system = container.querySelector('.msg-system');
+      if (system) system.remove();
+
+      const div = document.createElement('div');
+      div.className = `msg msg-${side}`;
+      div.innerHTML = `<span class="bubble">${text.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>`;
+      container.appendChild(div);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function updateStatus(type, state) {
+      const stateMap = {
+        'connected': 'connected', 'completed': 'connected',
+        'connecting': 'connecting', 'checking': 'connecting',
+        'failed': 'failed', 'disconnected': 'failed',
+        'open': 'connected', 'closed': 'waiting',
+        '-': 'waiting',
+      };
+      const cls = stateMap[state] || 'connecting';
+      const labelMap = {
+        ice: 'iceStatusBadge',
+        connection: 'connStatusBadge',
+        datachannel: 'dcStatusBadge',
+      };
+      const el = document.getElementById(labelMap[type]);
+      if (!el) return;
+      const prefix = { ice: 'ICE', connection: '接続', datachannel: 'DC' }[type];
+      el.textContent = `${prefix}: ${state}`;
+      el.className = `badge badge-${cls}`;
+
+      // DataChannelが開いたらチャットを有効化
+      if (type === 'datachannel' && state === 'open') {
+        document.getElementById('msgInput').disabled = false;
+        document.getElementById('sendBtn').disabled = false;
+        document.getElementById('msgInput').focus();
+        addMessage('system', '✅ DataChannel接続成功！メッセージを送信できます');
+      }
+    }
+
+    function localLog(msg) {
+      if (logPanel) {
+        logPanel.addLocal(msg);
+      }
+    }
+  </script>
+</body>
+</html>

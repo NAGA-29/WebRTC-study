@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Phase 5: 座標同期</title>
+  <style>
+    body { font-family: sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }
+    h1 { font-size: 1.2em; color: #333; }
+    .status { padding: 8px 12px; border-radius: 4px; margin: 8px 0; font-weight: bold; display: inline-block; }
+    .waiting    { background: #e9ecef; color: #495057; }
+    .connecting { background: #fff3cd; color: #856404; }
+    .connected  { background: #d4edda; color: #155724; }
+    .failed     { background: #f8d7da; color: #721c24; }
+    button { padding: 8px 16px; cursor: pointer; margin: 4px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* Canvas エリア */
+    #canvasContainer {
+      margin: 16px 0;
+      position: relative;
+      display: inline-block;
+      cursor: crosshair;
+    }
+    canvas {
+      border: 2px solid #ccc;
+      border-radius: 4px;
+      display: block;
+      background: #f0f4ff;
+    }
+    #hint { display: none; font-size: 13px; color: #555; margin: 4px 0; }
+
+    /* 凡例 */
+    .legend { font-size: 12px; margin: 4px 0; }
+    .dot-me   { display: inline-block; width: 14px; height: 14px; background: #0078d4; border-radius: 50%; vertical-align: middle; }
+    .dot-them { display: inline-block; width: 14px; height: 14px; background: #e03e1a; border-radius: 50%; vertical-align: middle; }
+
+    /* 接続設定フォーム */
+    #setupArea { margin: 12px 0; }
+    #setupArea label { margin-right: 10px; font-size: 14px; }
+    #setupArea input[type=text] { padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; width: 120px; }
+
+    .log { background: #1e1e1e; color: #d4d4d4; padding: 8px; height: 140px;
+           overflow-y: auto; font-size: 11px; white-space: pre-wrap; border-radius: 4px; margin-top: 8px;
+           font-family: monospace; }
+    .ok   { color: #4ec9b0; }
+    .warn { color: #dcdcaa; }
+    .err  { color: #f44747; }
+    details summary { cursor: pointer; font-size: 12px; color: #666; margin-top: 8px; }
+
+    /* 統計 */
+    #stats { font-size: 12px; color: #666; margin: 4px 0; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h1>Phase 5: リアルタイム座標同期（ArkEve応用）</h1>
+  <p>2つのタブで開き、片方のマウス移動が相手のタブにリアルタイムで表示されます。</p>
+
+  <!-- 接続設定 -->
+  <div id="setupArea">
+    <label>ロール:
+      <select id="roleSelect">
+        <option value="offerer">Offerer</option>
+        <option value="answerer">Answerer</option>
+      </select>
+    </label>
+    <label>ルームID:
+      <input type="text" id="roomInput" value="room1">
+    </label>
+    <button id="connectBtn" onclick="init()">接続開始</button>
+    <button onclick="doReset()" style="background:#dc3545;color:white">リセット</button>
+  </div>
+
+  <div id="statusDiv" class="status waiting">状態: 待機中</div>
+  <div id="hint">マウスをCanvas上で動かしてください！</div>
+
+  <p class="legend">
+    <span class="dot-me"></span> 自分のカーソル &nbsp;
+    <span class="dot-them"></span> 相手のカーソル
+  </p>
+
+  <!-- キャンバス -->
+  <div id="canvasContainer">
+    <canvas id="canvas" width="600" height="400"></canvas>
+  </div>
+
+  <div id="stats">送信: 0 回 / 受信: 0 回</div>
+
+  <details>
+    <summary>接続ログ</summary>
+    <div id="log" class="log"></div>
+  </details>
+
+  <script type="module">
+    import { connect, sendCoordinates, getRemotePosition, resetConnection } from './app.js';
+
+    // URLパラメータがあればフォームに反映
+    const params = new URLSearchParams(location.search);
+    if (params.get('role')) document.getElementById('roleSelect').value = params.get('role');
+    if (params.get('room')) document.getElementById('roomInput').value  = params.get('room');
+
+    const canvas = document.getElementById('canvas');
+    const ctx    = canvas.getContext('2d');
+    let myX = -100, myY = -100;
+    let sendCount = 0, recvCount = 0;
+
+    // ===== 接続開始 =====
+    window.init = async () => {
+      // URLパラメータを更新してページをリロードすることで role/room を app.js に渡す
+      const role = document.getElementById('roleSelect').value;
+      const room = document.getElementById('roomInput').value;
+      const newURL = `${location.pathname}?role=${role}&room=${encodeURIComponent(room)}`;
+      if (location.search !== `?role=${role}&room=${encodeURIComponent(room)}`) {
+        location.href = newURL;
+        return;
+      }
+      document.getElementById('connectBtn').disabled = true;
+      document.getElementById('setupArea').querySelectorAll('select, input').forEach(el => el.disabled = true);
+      await connect();
+    };
+
+    window.doReset = async () => {
+      await resetConnection();
+      document.getElementById('connectBtn').disabled = false;
+      document.getElementById('setupArea').querySelectorAll('select, input').forEach(el => el.disabled = false);
+      myX = myY = -100;
+    };
+
+    // ===== マウスイベント: Canvas上のマウス座標を正規化して送信 =====
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      myX = e.clientX - rect.left;
+      myY = e.clientY - rect.top;
+
+      // 座標を0.0〜1.0に正規化して送信（解像度非依存）
+      const nx = myX / canvas.width;
+      const ny = myY / canvas.height;
+      sendCoordinates(nx, ny);
+      sendCount++;
+      updateStats();
+    });
+
+    canvas.addEventListener('mouseleave', () => {
+      myX = myY = -100;
+    });
+
+    // ===== 描画ループ（requestAnimationFrame）=====
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // グリッド（参考線）
+      ctx.strokeStyle = '#dde';
+      ctx.lineWidth = 0.5;
+      for (let x = 50; x < canvas.width; x += 50) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+      }
+      for (let y = 50; y < canvas.height; y += 50) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+      }
+
+      // 自分のカーソル（青い丸）
+      if (myX >= 0 && myX <= canvas.width) {
+        ctx.fillStyle = '#0078d4';
+        ctx.beginPath();
+        ctx.arc(myX, myY, 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'white';
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('ME', myX, myY);
+      }
+
+      // 相手のカーソル（赤い丸）
+      const remote = getRemotePosition();
+      // 相手の座標は正規化値（0.0〜1.0）→ Canvas座標に変換
+      const rx = remote.x * canvas.width;
+      const ry = remote.y * canvas.height;
+      if (rx >= 0 && rx <= canvas.width + 1) {
+        ctx.fillStyle = '#e03e1a';
+        ctx.beginPath();
+        ctx.arc(rx, ry, 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'white';
+        ctx.font = 'bold 9px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('YOU', rx, ry);
+        recvCount++;
+        updateStats();
+      }
+
+      requestAnimationFrame(draw);
+    }
+
+    function updateStats() {
+      document.getElementById('stats').textContent =
+        `送信: ${sendCount} 回 / 描画更新: ${recvCount} 回`;
+    }
+
+    // ページ読み込み後に描画ループ開始
+    draw();
+
+    // URLに role パラメータがあれば自動接続
+    if (params.get('role')) {
+      init();
+    }
+  </script>
+</body>
+</html>
